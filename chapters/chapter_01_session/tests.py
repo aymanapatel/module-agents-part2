@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 # Swap this import for `from starter import ...` to test your work.
-from chapters.chapter_01_session.solution import (
+from chapters.chapter_01_session.starter import (
     InvalidStateTransition,
     SessionEscapeError,
     SessionNotFoundError,

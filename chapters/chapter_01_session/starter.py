@@ -11,6 +11,7 @@ can focus on the Session substrate itself.
 
 from __future__ import annotations
 
+import json
 import secrets
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 # You may use these helpers from the framework — they're what the real code uses too.
+from sovereign_agent._internal.atomic import atomic_append_jsonl, atomic_write_json
 from sovereign_agent.errors import IOError as SovereignIOError
 from sovereign_agent.errors import ValidationError
 
@@ -172,7 +174,23 @@ class Session:
     #   - return the resolved absolute Path on success
     # ------------------------------------------------------------------
     def path(self, relative: str | Path) -> Path:
-        raise NotImplementedError("TODO 1: implement traversal-safe path resolution")
+        base = self.directory.resolve()
+        rel = Path(relative)
+        if rel.is_absolute():
+            raise SessionEscapeError(
+                f"absolute path not allowed: {relative!r}",
+                {"requested": str(relative), "session_dir": str(base)},
+            )
+
+        candidate = (base / rel).resolve()
+        try:
+            candidate.relative_to(base)
+        except ValueError as exc:
+            raise SessionEscapeError(
+                f"path {relative!r} escapes session directory",
+                {"requested": str(relative), "resolved": str(candidate), "session_dir": str(base)},
+            ) from exc
+        return candidate
 
     # ------------------------------------------------------------------
     # TODO 2: update_state() — atomic write of session.json.
@@ -184,7 +202,19 @@ class Session:
     #   - write session.json atomically (atomic_write_json is provided)
     # ------------------------------------------------------------------
     def update_state(self, **changes: object) -> None:
-        raise NotImplementedError("TODO 2: implement atomic state update with transition check")
+        if "state" in changes:
+            proposed = str(changes["state"])
+            allowed = ALLOWED_TRANSITIONS.get(self.state.state, frozenset())
+            if proposed not in allowed:
+                raise InvalidStateTransition(self.state.state, proposed)
+
+        for key, value in changes.items():
+            if not hasattr(self.state, key):
+                raise AttributeError(f"SessionState has no field {key!r}")
+            setattr(self.state, key, value)
+        self.state.updated_at = now_utc()
+
+        atomic_write_json(self.session_json_path, self.state.to_dict())
 
     # ------------------------------------------------------------------
     # TODO 3: append_trace_event() — atomic append to logs/trace.jsonl.
@@ -192,7 +222,7 @@ class Session:
     # Hint: atomic_append_jsonl is provided.
     # ------------------------------------------------------------------
     def append_trace_event(self, event: dict) -> None:
-        raise NotImplementedError("TODO 3: append event to trace.jsonl atomically")
+        atomic_append_jsonl(self.trace_path, event)
 
     # ------------------------------------------------------------------
     # Lifecycle shortcuts (provided once the above TODOs work)
@@ -240,7 +270,46 @@ def create_session(
 ) -> Session:
     # TODO 4a: generate an id, make the directory tree, write session.json,
     # write a minimal SESSION.md, return the Session object.
-    raise NotImplementedError("TODO 4a: create_session")
+    sessions_root = sessions_dir or DEFAULT_SESSIONS_DIR
+    sid = _generate_session_id()
+    directory = sessions_root / sid
+    if directory.exists():
+        raise SovereignIOError(
+            code="SA_IO_ATOMIC_WRITE_FAILED",
+            message=f"session directory already exists: {directory}",
+            context={"session_id": sid},
+        )
+
+    directory.mkdir(parents=True, exist_ok=False)
+    _make_subdirs(directory)
+
+    now = now_utc()
+    state = SessionState(
+        session_id=sid,
+        created_at=now,
+        updated_at=now,
+        scenario=scenario,
+        state="planning",
+    )
+    atomic_write_json(directory / "session.json", state.to_dict())
+    (directory / "SESSION.md").write_text(
+        "\n".join(
+            [
+                f"# Session {sid}",
+                "",
+                f"**Scenario:** {scenario}",
+                f"**Created:** {now.isoformat()}",
+                "",
+                "## Task description",
+                "",
+                task or "(no task description provided)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    return Session(sid, directory, state)
 
 
 def load_session(
@@ -249,7 +318,15 @@ def load_session(
 ) -> Session:
     # TODO 4b: read session.json from sessions/<id>/ and return a Session.
     # Raise SessionNotFoundError if the dir or file is missing.
-    raise NotImplementedError("TODO 4b: load_session")
+    sessions_root = sessions_dir or DEFAULT_SESSIONS_DIR
+    directory = sessions_root / session_id
+    session_json = directory / "session.json"
+    if not directory.exists() or not session_json.exists():
+        raise SessionNotFoundError(session_id)
+
+    with open(session_json, encoding="utf-8") as f:
+        state = SessionState.from_dict(json.load(f))
+    return Session(session_id, directory, state)
 
 
 def list_sessions(
@@ -258,7 +335,26 @@ def list_sessions(
 ) -> list[Session]:
     # TODO 4c: iterate sessions_dir, load each, optionally filter by state,
     # return list sorted newest-first.
-    raise NotImplementedError("TODO 4c: list_sessions")
+    sessions_root = sessions_dir or DEFAULT_SESSIONS_DIR
+    if not sessions_root.exists():
+        return []
+
+    sessions: list[Session] = []
+    for entry in sessions_root.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("sess_"):
+            continue
+        if not (entry / "session.json").exists():
+            continue
+        try:
+            session = load_session(entry.name, sessions_dir=sessions_root)
+        except Exception:
+            continue
+        if state_filter is not None and session.state.state != state_filter:
+            continue
+        sessions.append(session)
+
+    sessions.sort(key=lambda s: s.state.created_at, reverse=True)
+    return sessions
 
 
 __all__ = [
