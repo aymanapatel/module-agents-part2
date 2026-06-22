@@ -1,0 +1,2 @@
+{"event_type": "demo.started", "actor": "demo"}
+{"event_type": "demo.note", "actor": "demo", "payload": {"msg": "hello"}}
